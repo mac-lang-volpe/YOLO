@@ -1,0 +1,240 @@
+"""Arch webcam vehicle counting with YOLO.
+
+This script is designed to run as a one-off command today and remain
+Databricks-friendly later by keeping the core logic importable, serializable,
+and free of notebook-specific display calls.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional
+
+os.environ.pop("OPENSSL_FORCE_FIPS_MODE", None)
+
+import cv2
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+from ultralytics import YOLO
+
+
+DEFAULT_WEBCAM_PAGE_URL = (
+    "https://www.nps.gov/media/webcam/view.htm?id=81B46BDB-1DD8-B71B-0B250E8F4CC1E74A"
+)
+DEFAULT_FALLBACK_IMAGE_URL = "https://www.nps.gov/webcams-arch/arch_traffic.jpg"
+DEFAULT_MODEL_PATH = "yolov8x.pt"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent.parent / "YOLO" / "arch_vehicle_count_latest.json"
+VEHICLE_CLASSES = [2, 3, 5, 7]
+
+
+@dataclass(frozen=True)
+class Config:
+    webcam_page_url: str = DEFAULT_WEBCAM_PAGE_URL
+    fallback_image_url: str = DEFAULT_FALLBACK_IMAGE_URL
+    model_path: str = DEFAULT_MODEL_PATH
+    output_path: Path = DEFAULT_OUTPUT_PATH
+    confidence: float = 0.50
+    iou: float = 0.45
+    image_size: int = 1280
+    user_agent: str = DEFAULT_USER_AGENT
+
+
+@dataclass
+class DetectionBox:
+    class_id: int
+    class_name: str
+    confidence: float
+    xyxy: list[float]
+
+
+@dataclass
+class RunResult:
+    status: str
+    timestamp_utc: str
+    webcam_page_url: str
+    image_url: Optional[str] = None
+    model_path: str = DEFAULT_MODEL_PATH
+    vehicle_count: int = 0
+    detections: list[DetectionBox] = field(default_factory=list)
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+def load_config() -> Config:
+    """Load runtime settings from environment variables."""
+
+    output_path = Path(os.getenv("OUTPUT_PATH", str(DEFAULT_OUTPUT_PATH))).expanduser()
+    return Config(
+        webcam_page_url=os.getenv("WEBCAM_PAGE_URL", DEFAULT_WEBCAM_PAGE_URL),
+        fallback_image_url=os.getenv("FALLBACK_IMAGE_URL", DEFAULT_FALLBACK_IMAGE_URL),
+        model_path=os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH),
+        output_path=output_path,
+        confidence=float(os.getenv("YOLO_CONFIDENCE", "0.50")),
+        iou=float(os.getenv("YOLO_IOU", "0.45")),
+        image_size=int(os.getenv("YOLO_IMAGE_SIZE", "1280")),
+        user_agent=os.getenv("USER_AGENT", DEFAULT_USER_AGENT),
+    )
+
+
+def build_headers(user_agent: str) -> dict[str, str]:
+    return {"User-Agent": user_agent}
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_image_url(page_html: bytes, fallback_image_url: str) -> str:
+    soup = BeautifulSoup(page_html, "html.parser")
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if ".jpg" in src.lower() and ("webcam" in src.lower() or "arch" in src.lower()):
+            if src.startswith("/"):
+                return "https://www.nps.gov" + src
+            return src
+    return fallback_image_url
+
+
+def fetch_bytes(url: str, headers: dict[str, str], timeout: int = 10) -> requests.Response:
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def download_image(image_url: str, headers: dict[str, str]) -> np.ndarray:
+    response = fetch_bytes(image_url, headers=headers)
+    image_array = np.asarray(bytearray(response.content), dtype=np.uint8)
+    img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("OpenCV could not decode the downloaded image")
+    return img
+
+
+@lru_cache(maxsize=1)
+def load_model(model_path: str) -> YOLO:
+    return YOLO(model_path)
+
+
+def serialize_detections(result: Any) -> list[DetectionBox]:
+    if not result.boxes:
+        return []
+
+    names = result.names or {}
+    detections: list[DetectionBox] = []
+    for box in result.boxes:
+        class_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else -1
+        confidence = float(box.conf[0]) if getattr(box, "conf", None) is not None else 0.0
+        coords = [float(value) for value in box.xyxy[0].tolist()]
+        detections.append(
+            DetectionBox(
+                class_id=class_id,
+                class_name=str(names.get(class_id, class_id)),
+                confidence=confidence,
+                xyxy=coords,
+            )
+        )
+    return detections
+
+
+def run_detection(config: Config) -> RunResult:
+    headers = build_headers(config.user_agent)
+    timestamp = now_utc_iso()
+
+    try:
+        page_response = fetch_bytes(config.webcam_page_url, headers=headers)
+        image_url = resolve_image_url(page_response.content, config.fallback_image_url)
+        img = download_image(image_url, headers=headers)
+
+        model = load_model(config.model_path)
+        results = model.predict(
+            img,
+            classes=VEHICLE_CLASSES,
+            conf=config.confidence,
+            iou=config.iou,
+            imgsz=config.image_size,
+            verbose=False,
+        )
+
+        detections = serialize_detections(results[0]) if results else []
+        return RunResult(
+            status="ok",
+            timestamp_utc=timestamp,
+            webcam_page_url=config.webcam_page_url,
+            image_url=image_url,
+            model_path=config.model_path,
+            vehicle_count=len(detections),
+            detections=detections,
+            message=f"Detected {len(detections)} vehicles",
+        )
+    except Exception as exc:
+        return RunResult(
+            status="error",
+            timestamp_utc=timestamp,
+            webcam_page_url=config.webcam_page_url,
+            model_path=config.model_path,
+            error=str(exc),
+        )
+
+
+def result_to_dict(result: RunResult) -> dict[str, Any]:
+    payload = asdict(result)
+    payload["detections"] = [asdict(detection) for detection in result.detections]
+    payload["output_schema"] = "arch_vehicle_count_v1"
+    return payload
+
+
+def write_result(result: RunResult, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = result_to_dict(result)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Count vehicles in the Arch webcam image")
+    parser.add_argument("--output", type=Path, default=None, help="Override output JSON path")
+    parser.add_argument("--model", default=None, help="Override YOLO model path")
+    parser.add_argument("--confidence", type=float, default=None, help="Override YOLO confidence threshold")
+    parser.add_argument("--iou", type=float, default=None, help="Override YOLO IOU threshold")
+    parser.add_argument("--imgsz", type=int, default=None, help="Override YOLO image size")
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> Config:
+    config = load_config()
+    return Config(
+        webcam_page_url=config.webcam_page_url,
+        fallback_image_url=config.fallback_image_url,
+        model_path=args.model or config.model_path,
+        output_path=args.output or config.output_path,
+        confidence=args.confidence if args.confidence is not None else config.confidence,
+        iou=args.iou if args.iou is not None else config.iou,
+        image_size=args.imgsz if args.imgsz is not None else config.image_size,
+        user_agent=config.user_agent,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    config = build_config(args)
+    result = run_detection(config)
+    output_path = write_result(result, config.output_path)
+
+    print(json.dumps(result_to_dict(result), indent=2))
+    print(f"Wrote result to {output_path}")
+    return 0 if result.status == "ok" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
